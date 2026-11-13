@@ -58,6 +58,7 @@ import org.apache.iceberg.mapping.MappedField;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
@@ -80,8 +81,12 @@ import org.apache.iceberg.variants.Variants;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 class RecordConverter {
+
+  private static final Logger LOG = LoggerFactory.getLogger(RecordConverter.class);
 
   private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -94,12 +99,14 @@ class RecordConverter {
   private final Schema tableSchema;
   private final NameMapping nameMapping;
   private final IcebergSinkConfig config;
+  private final boolean replaceNullWithDefault;
   private final Map<Integer, Map<String, NestedField>> structNameMap = Maps.newHashMap();
 
   RecordConverter(Table table, IcebergSinkConfig config) {
     this.tableSchema = table.schema();
     this.nameMapping = createNameMapping(table);
     this.config = config;
+    this.replaceNullWithDefault = config.replaceNullWithDefault();
   }
 
   Record convert(Object data) {
@@ -254,11 +261,20 @@ class RecordConverter {
                     hasSchemaUpdates = true;
                   }
                 }
+                Object recordFieldValue = fieldValueFromStruct(struct, recordField);
+                logIfNullForRequiredColumn(recordFieldValue, tableField, hasSchemaUpdates);
+                if (recordFieldValue == null && schemaUpdateConsumer != null && !hasSchemaUpdates) {
+                  evolveSchemaFromConnectSchema(
+                      recordField.schema(),
+                      tableField.type(),
+                      tableField.fieldId(),
+                      schemaUpdateConsumer);
+                }
                 if (!hasSchemaUpdates) {
                   result.setField(
                       tableField.name(),
                       convertValue(
-                          struct.get(recordField),
+                          recordFieldValue,
                           tableField.type(),
                           tableField.fieldId(),
                           schemaUpdateConsumer));
@@ -266,6 +282,107 @@ class RecordConverter {
               }
             });
     return result;
+  }
+
+  /**
+   * Recursively traverses the Connect schema and emits all evolution events (addColumn, updateType,
+   * and makeOptional) at every nested level.
+   *
+   * <p>Unlike {@link #convertToStruct(Struct, StructType, int, SchemaUpdate.Consumer)} which skips
+   * a field's children once an update is detected (deferring nested discovery to re-conversion),
+   * this method always recurses through the full schema.
+   */
+  private void evolveSchemaFromConnectSchema(
+      org.apache.kafka.connect.data.Schema recordSchema,
+      Type tableType,
+      int tableFieldId,
+      SchemaUpdate.Consumer schemaUpdateConsumer) {
+    if (recordSchema == null) {
+      return;
+    }
+    switch (recordSchema.type()) {
+      case STRUCT:
+        if (tableType.isStructType()) {
+          StructType structType = tableType.asStructType();
+          for (Field field : recordSchema.fields()) {
+            NestedField nestedField = lookupStructField(field.name(), structType, tableFieldId);
+            if (nestedField == null) {
+              String parentFieldName =
+                  tableFieldId < 0 ? null : tableSchema.findColumnName(tableFieldId);
+              Type type = SchemaUtils.toIcebergType(field.schema(), config);
+              schemaUpdateConsumer.addColumn(parentFieldName, field.name(), type);
+            } else {
+              PrimitiveType evolveDataType =
+                  SchemaUtils.needsDataTypeUpdate(nestedField.type(), field.schema());
+              if (evolveDataType != null) {
+                String fieldName = tableSchema.findColumnName(nestedField.fieldId());
+                schemaUpdateConsumer.updateType(fieldName, evolveDataType);
+              }
+              if (nestedField.isRequired() && field.schema().isOptional()) {
+                String fieldName = tableSchema.findColumnName(nestedField.fieldId());
+                schemaUpdateConsumer.makeOptional(fieldName);
+              }
+              evolveSchemaFromConnectSchema(
+                  field.schema(), nestedField.type(), nestedField.fieldId(), schemaUpdateConsumer);
+            }
+          }
+        } else {
+          logMismatchedType(recordSchema.type(), tableType);
+        }
+        break;
+      case ARRAY:
+        if (tableType.isListType()) {
+          ListType listType = tableType.asListType();
+          evolveSchemaFromConnectSchema(
+              recordSchema.valueSchema(),
+              listType.elementType(),
+              listType.elementId(),
+              schemaUpdateConsumer);
+        } else {
+          logMismatchedType(recordSchema.type(), tableType);
+        }
+        break;
+      case MAP:
+        if (tableType.isMapType()) {
+          MapType mapType = tableType.asMapType();
+          evolveSchemaFromConnectSchema(
+              recordSchema.valueSchema(),
+              mapType.valueType(),
+              mapType.valueId(),
+              schemaUpdateConsumer);
+        } else {
+          logMismatchedType(recordSchema.type(), tableType);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  private void logIfNullForRequiredColumn(
+      Object value, NestedField tableField, boolean hasSchemaUpdates) {
+    if (value == null && tableField.isRequired() && !hasSchemaUpdates) {
+      LOG.warn(
+          "Null value for required column {}; the write will fail. Consider setting"
+              + " iceberg.tables.schema-force-optional=true or altering the column to optional",
+          tableSchema.findColumnName(tableField.fieldId()));
+    }
+  }
+
+  private void logMismatchedType(
+      org.apache.kafka.connect.data.Schema.Type recordSchemaType, Type tableType) {
+    LOG.warn(
+        "Record schema of type {} does not match table of type {}", recordSchemaType, tableType);
+  }
+
+  /**
+   * Reads a struct field value. {@link Struct#get(Field)} substitutes the schema default value when
+   * the stored value is null, which turns an explicit null into the default; whether that
+   * substitution happens is controlled by the {@code iceberg.tables.replace-null-with-default}
+   * setting.
+   */
+  private Object fieldValueFromStruct(Struct struct, Field field) {
+    return replaceNullWithDefault ? struct.get(field) : struct.getWithoutDefault(field.name());
   }
 
   private NestedField lookupStructField(String fieldName, StructType schema, int structFieldId) {
@@ -300,28 +417,29 @@ class RecordConverter {
       Object value, ListType type, SchemaUpdate.Consumer schemaUpdateConsumer) {
     Preconditions.checkArgument(value instanceof List);
     List<?> list = (List<?>) value;
-    return list.stream()
-        .map(
-            element -> {
-              int fieldId = type.fields().get(0).fieldId();
-              return convertValue(element, type.elementType(), fieldId, schemaUpdateConsumer);
-            })
-        .collect(Collectors.toList());
+    int elementFieldId = type.fields().get(0).fieldId();
+    Type elementType = type.elementType();
+    List<Object> result = Lists.newArrayListWithCapacity(list.size());
+    for (Object element : list) {
+      result.add(convertValue(element, elementType, elementFieldId, schemaUpdateConsumer));
+    }
+    return result;
   }
 
   protected Map<Object, Object> convertMapValue(
       Object value, MapType type, SchemaUpdate.Consumer schemaUpdateConsumer) {
     Preconditions.checkArgument(value instanceof Map);
     Map<?, ?> map = (Map<?, ?>) value;
-    Map<Object, Object> result = Maps.newHashMap();
+    int keyFieldId = type.fields().get(0).fieldId();
+    int valueFieldId = type.fields().get(1).fieldId();
+    Type keyType = type.keyType();
+    Type valueType = type.valueType();
+    Map<Object, Object> result = Maps.newHashMapWithExpectedSize(map.size());
     map.forEach(
-        (k, v) -> {
-          int keyFieldId = type.fields().get(0).fieldId();
-          int valueFieldId = type.fields().get(1).fieldId();
-          result.put(
-              convertValue(k, type.keyType(), keyFieldId, schemaUpdateConsumer),
-              convertValue(v, type.valueType(), valueFieldId, schemaUpdateConsumer));
-        });
+        (k, v) ->
+            result.put(
+                convertValue(k, keyType, keyFieldId, schemaUpdateConsumer),
+                convertValue(v, valueType, valueFieldId, schemaUpdateConsumer)));
     return result;
   }
 
@@ -486,7 +604,9 @@ class RecordConverter {
     }
 
     List<String> sortedFieldNames =
-        collectFieldNames(value).stream().sorted().collect(Collectors.toList());
+        collectFieldNames(value).stream()
+            .sorted(VariantMetadata.FIELD_NAME_ORDER)
+            .collect(Collectors.toList());
     VariantMetadata metadata = Variants.metadata(sortedFieldNames);
     return Variant.of(metadata, objectToVariantValue(value, metadata, null));
   }
@@ -496,7 +616,7 @@ class RecordConverter {
    * null, scalar values, and empty maps, lists, or structs. Map keys must be strings; non-string
    * keys cause IllegalArgumentException.
    */
-  private static Set<String> collectFieldNames(Object value) {
+  private Set<String> collectFieldNames(Object value) {
     if (value == null) {
       return Collections.emptySet();
     }
@@ -533,7 +653,7 @@ class RecordConverter {
       fields.forEach(
           field -> {
             names.add(field.name());
-            names.addAll(collectFieldNames(struct.get(field)));
+            names.addAll(collectFieldNames(fieldValueFromStruct(struct, field)));
           });
       return names;
     }
@@ -544,7 +664,7 @@ class RecordConverter {
    * Recursively converts a Java object to a VariantValue using the given shared metadata for all
    * nested maps. Handles primitives, List (array), and Map (object); map keys become field names.
    */
-  private static VariantValue objectToVariantValue(
+  private VariantValue objectToVariantValue(
       Object value, VariantMetadata metadata, org.apache.kafka.connect.data.Schema schema) {
     if (value == null) {
       return Variants.ofNull();
@@ -568,7 +688,9 @@ class RecordConverter {
     if (value instanceof Struct struct) {
       ShreddedObject object = Variants.object(metadata);
       for (Field field : struct.schema().fields()) {
-        object.put(field.name(), objectToVariantValue(struct.get(field), metadata, field.schema()));
+        object.put(
+            field.name(),
+            objectToVariantValue(fieldValueFromStruct(struct, field), metadata, field.schema()));
       }
       return object;
     }
@@ -576,7 +698,7 @@ class RecordConverter {
   }
 
   /** Converts a Map to VariantValue; throw IllegalArgumentException if the key is not a string. */
-  private static VariantValue mapToVariantValue(
+  private VariantValue mapToVariantValue(
       Map<?, ?> map, VariantMetadata metadata, org.apache.kafka.connect.data.Schema schema) {
     ShreddedObject object = Variants.object(metadata);
     org.apache.kafka.connect.data.Schema mapValueSchema =

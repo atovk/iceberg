@@ -104,12 +104,14 @@ class DynamicRecordProcessor<T> extends ProcessFunction<T, DynamicRecordInternal
     this.forwardStream =
         new OutputTag<>(
             DYNAMIC_FORWARD_STREAM,
-            new DynamicRecordInternalType(catalogLoader, true, cacheMaximumSize)) {};
+            new DynamicRecordInternalType(
+                catalogLoader, true, cacheMaximumSize, inputSchemasPerTableCacheMaximumSize)) {};
     if (!immediateUpdate) {
       updateStream =
           new OutputTag<>(
               DYNAMIC_TABLE_UPDATE_STREAM,
-              new DynamicRecordInternalType(catalogLoader, true, cacheMaximumSize)) {};
+              new DynamicRecordInternalType(
+                  catalogLoader, true, cacheMaximumSize, inputSchemasPerTableCacheMaximumSize)) {};
     }
 
     this.dynamicRecordWithConfig =
@@ -129,8 +131,8 @@ class DynamicRecordProcessor<T> extends ProcessFunction<T, DynamicRecordInternal
   public void collect(DynamicRecord inputData) {
     DynamicRecordWithConfig data = dynamicRecordWithConfig.wrap(inputData);
 
-    boolean isForward = data.distributionMode() == null;
-    boolean exists = tableCache.exists(data.tableIdentifier()).f0;
+    boolean isForward = isForwardEligible(data);
+    boolean exists = tableCache.exists(data.tableIdentifier());
     String foundBranch = exists ? tableCache.branch(data.tableIdentifier(), data.branch()) : null;
 
     TableMetadataCache.ResolvedSchemaInfo foundSchema =
@@ -159,15 +161,10 @@ class DynamicRecordProcessor<T> extends ProcessFunction<T, DynamicRecordInternal
             newData.f1,
             isForward);
       } else {
-        // Shuffled records with immediateUpdate=false go to the update side output
-        int writerKey =
-            hashKeyGenerator.generateKey(
-                data,
-                foundSchema.resolvedTableSchema() != null
-                    ? foundSchema.resolvedTableSchema()
-                    : data.schema(),
-                foundSpec != null ? foundSpec : data.spec(),
-                data.rowData());
+        // Shuffled records with immediateUpdate=false go to the update side output.
+        // Key them with the record's own schema, spec and row: the raw row is laid out by the
+        // record's schema, so the table's schema or spec cannot be used with it.
+        int writerKey = hashKeyGenerator.generateKey(data);
         context.output(
             updateStream,
             new DynamicRecordInternal(
@@ -223,5 +220,18 @@ class DynamicRecordProcessor<T> extends ProcessFunction<T, DynamicRecordInternal
     } catch (Exception e) {
       throw new RuntimeException(e);
     }
+  }
+
+  /**
+   * Forward mode is incompatible with equality fields: records sharing the same equality key must
+   * land on the same writer subtask to preserve equality-delete semantics. A record can only take
+   * the forward path when the user requested it (null distribution mode) and the record resolves to
+   * an empty equality-field set (no user-supplied set and no schema identifier fields).
+   */
+  @VisibleForTesting
+  static boolean isForwardEligible(DynamicRecord data) {
+    return data.distributionMode() == null
+        && DynamicSinkUtil.resolveEqualityFieldNames(data.equalityFields(), data.schema())
+            .isEmpty();
   }
 }

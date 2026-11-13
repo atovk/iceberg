@@ -21,8 +21,13 @@ package org.apache.iceberg.flink.sink.dynamic;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.nio.file.Path;
+import java.time.LocalDate;
 import java.util.Map;
 import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.table.data.GenericRowData;
+import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.data.StringData;
+import org.apache.iceberg.CachingCatalog;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SnapshotRef;
@@ -31,6 +36,7 @@ import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.SupportsNamespaces;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.flink.sink.TestFlinkIcebergSinkBase;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
 import org.apache.iceberg.types.Types;
@@ -114,6 +120,28 @@ public class TestTableUpdater extends TestFlinkIcebergSinkBase {
   }
 
   @Test
+  void testBranchConcurrentlyCreatedByAnotherWriter() {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    TableIdentifier tableIdentifier = TableIdentifier.parse("myTable");
+    catalog.createTable(tableIdentifier, SCHEMA);
+
+    TableMetadataCache cache =
+        new TableMetadataCache(catalog, 10, Long.MAX_VALUE, 10, CASE_SENSITIVE, PRESERVE_COLUMNS);
+    TableUpdater tableUpdater = new TableUpdater(cache, catalog, CASE_SENSITIVE, PRESERVE_COLUMNS);
+
+    // This writer's cache while the branch genuinely does not exist yet.
+    assertThat(cache.branch(tableIdentifier, "myBranch")).isNull();
+
+    // Simulate another writer subtask committing the branch
+    catalog.loadTable(tableIdentifier).manageSnapshots().createBranch("myBranch").commit();
+
+    // Must not throw: a branch concurrently created by another writer must be treated success
+    tableUpdater.update(
+        tableIdentifier, "myBranch", SCHEMA, PartitionSpec.unpartitioned(), TableCreator.DEFAULT);
+    assertThat(cache.branch(tableIdentifier, "myBranch")).isNotNull();
+  }
+
+  @Test
   void testBranchCreationAndCaching() {
     Catalog catalog = CATALOG_EXTENSION.catalog();
     TableIdentifier tableIdentifier = TableIdentifier.parse("myTable");
@@ -172,6 +200,90 @@ public class TestTableUpdater extends TestFlinkIcebergSinkBase {
     assertThat(updated.sameSchema(SCHEMA2)).isTrue();
     assertThat(cache.schema(tableIdentifier, SCHEMA2).resolvedTableSchema().sameSchema(SCHEMA2))
         .isTrue();
+  }
+
+  @Test
+  void testAddColumnWithDataConverterNarrowing() {
+    Schema tableSchema =
+        new Schema(
+            Types.NestedField.optional(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "data", Types.StringType.get()));
+    Schema rowSchema =
+        new Schema(
+            Types.NestedField.optional(1, "id", Types.IntegerType.get()),
+            Types.NestedField.optional(2, "data", Types.StringType.get()),
+            Types.NestedField.optional(3, "extra", Types.StringType.get()));
+
+    TableMetadataCache.ResolvedSchemaInfo result =
+        updateWithAddedColumnAndConversion(tableSchema, rowSchema);
+
+    RowData converted =
+        (RowData)
+            result
+                .recordConverter()
+                .convert(
+                    GenericRowData.of(5, StringData.fromString("a"), StringData.fromString("x")));
+    assertThat(converted.getLong(0)).isEqualTo(5L);
+    assertThat(converted.getString(1)).hasToString("a");
+    assertThat(converted.getString(2)).hasToString("x");
+  }
+
+  @Test
+  void testAddColumnWithDateToTimestampConversion() {
+    Schema tableSchema =
+        new Schema(
+            Types.NestedField.optional(1, "ts", Types.TimestampType.withoutZone()),
+            Types.NestedField.optional(2, "data", Types.StringType.get()));
+    Schema rowSchema =
+        new Schema(
+            Types.NestedField.optional(1, "ts", Types.DateType.get()),
+            Types.NestedField.optional(2, "data", Types.StringType.get()),
+            Types.NestedField.optional(3, "extra", Types.StringType.get()));
+
+    TableMetadataCache.ResolvedSchemaInfo result =
+        updateWithAddedColumnAndConversion(tableSchema, rowSchema);
+
+    LocalDate date = LocalDate.of(2026, 6, 30);
+    RowData converted =
+        (RowData)
+            result
+                .recordConverter()
+                .convert(
+                    GenericRowData.of(
+                        (int) date.toEpochDay(),
+                        StringData.fromString("a"),
+                        StringData.fromString("x")));
+    assertThat(converted.getTimestamp(0, 6).toLocalDateTime()).isEqualTo(date.atStartOfDay());
+    assertThat(converted.getString(1)).hasToString("a");
+    assertThat(converted.getString(2)).hasToString("x");
+  }
+
+  private TableMetadataCache.ResolvedSchemaInfo updateWithAddedColumnAndConversion(
+      Schema tableSchema, Schema rowSchema) {
+    Catalog catalog = CATALOG_EXTENSION.catalog();
+    TableIdentifier tableIdentifier = TableIdentifier.parse("default.myTable");
+    catalog.createTable(tableIdentifier, tableSchema);
+
+    TableMetadataCache cache =
+        new TableMetadataCache(catalog, 10, Long.MAX_VALUE, 10, CASE_SENSITIVE, PRESERVE_COLUMNS);
+    TableUpdater tableUpdater = new TableUpdater(cache, catalog, CASE_SENSITIVE, PRESERVE_COLUMNS);
+
+    TableMetadataCache.ResolvedSchemaInfo result =
+        tableUpdater.update(
+                tableIdentifier,
+                SnapshotRef.MAIN_BRANCH,
+                rowSchema,
+                PartitionSpec.unpartitioned(),
+                TableCreator.DEFAULT)
+            .f0;
+
+    Schema evolved = catalog.loadTable(tableIdentifier).schema();
+    Types.NestedField convertedColumn = tableSchema.columns().get(0);
+    assertThat(evolved.findField(convertedColumn.name()).type()).isEqualTo(convertedColumn.type());
+    assertThat(evolved.findField("extra")).isNotNull();
+    assertThat(result.compareResult())
+        .isEqualTo(CompareSchemasVisitor.Result.DATA_CONVERSION_NEEDED);
+    return result;
   }
 
   @Test
@@ -342,5 +454,64 @@ public class TestTableUpdater extends TestFlinkIcebergSinkBase {
     assertThat(catalog.tableExists(tableIdentifier)).isTrue();
     assertThat(result.f0.resolvedTableSchema().sameSchema(SCHEMA)).isTrue();
     assertThat(result.f0.compareResult()).isEqualTo(CompareSchemasVisitor.Result.SAME);
+  }
+
+  @Test
+  void testNamespaceCreatedWhenCatalogReportsMissingNamespaceAsMissingTable() {
+    // Like the Glue catalog, which throws NoSuchTableException for a table in a missing namespace
+    InMemoryCatalog catalog =
+        new InMemoryCatalog() {
+          @Override
+          public Table loadTable(TableIdentifier identifier) {
+            if (!namespaceExists(identifier.namespace())) {
+              throw new NoSuchTableException("Table does not exist: %s", identifier);
+            }
+
+            return super.loadTable(identifier);
+          }
+        };
+    catalog.initialize("catalog", Map.of());
+    Namespace namespace = Namespace.of("glue_like_namespace");
+    TableIdentifier tableIdentifier = TableIdentifier.of(namespace, "myTable");
+    TableMetadataCache cache =
+        new TableMetadataCache(catalog, 10, Long.MAX_VALUE, 10, CASE_SENSITIVE, PRESERVE_COLUMNS);
+    TableUpdater tableUpdater = new TableUpdater(cache, catalog, CASE_SENSITIVE, PRESERVE_COLUMNS);
+
+    // The record processor looks the table up before calling the updater, so the updater only
+    // sees the cached answer, which carries no exception
+    cache.exists(tableIdentifier);
+
+    tableUpdater.update(
+        tableIdentifier,
+        SnapshotRef.MAIN_BRANCH,
+        SCHEMA,
+        PartitionSpec.unpartitioned(),
+        TableCreator.DEFAULT);
+
+    assertThat(catalog.namespaceExists(namespace)).isTrue();
+    assertThat(catalog.tableExists(tableIdentifier)).isTrue();
+  }
+
+  @Test
+  void testTableCreatedForCatalogWithoutNamespaceSupport() {
+    InMemoryCatalog inMemoryCatalog = new InMemoryCatalog();
+    inMemoryCatalog.initialize("catalog", Map.of());
+    Namespace namespace = Namespace.of("some_namespace");
+    inMemoryCatalog.createNamespace(namespace);
+    Catalog catalog = CachingCatalog.wrap(inMemoryCatalog);
+    assertThat(catalog).isNotInstanceOf(SupportsNamespaces.class);
+    TableIdentifier tableIdentifier = TableIdentifier.of(namespace, "myTable");
+    TableMetadataCache cache =
+        new TableMetadataCache(catalog, 10, Long.MAX_VALUE, 10, CASE_SENSITIVE, PRESERVE_COLUMNS);
+    TableUpdater tableUpdater = new TableUpdater(cache, catalog, CASE_SENSITIVE, PRESERVE_COLUMNS);
+
+    tableUpdater.update(
+        tableIdentifier,
+        SnapshotRef.MAIN_BRANCH,
+        SCHEMA,
+        PartitionSpec.unpartitioned(),
+        TableCreator.DEFAULT);
+
+    assertThat(catalog.tableExists(tableIdentifier)).isTrue();
   }
 }

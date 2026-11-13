@@ -72,6 +72,10 @@ abstract class ManifestMergeManager<F extends ContentFile<F>> {
 
   protected abstract ManifestReader<F> newManifestReader(ManifestFile manifest);
 
+  protected ManifestReader<F> newManifestReader(ManifestFile manifest, boolean isCommitted) {
+    return newManifestReader(manifest);
+  }
+
   Iterable<ManifestFile> mergeManifests(Iterable<ManifestFile> manifests) {
     Iterator<ManifestFile> manifestIter = manifests.iterator();
     if (!mergeEnabled || !manifestIter.hasNext()) {
@@ -101,7 +105,7 @@ abstract class ManifestMergeManager<F extends ContentFile<F>> {
     return replacedManifestsCount.get();
   }
 
-  void cleanUncommitted(Set<ManifestFile> committed) {
+  void cleanUncommitted(Set<String> committed) {
     // iterate over a copy of entries to avoid concurrent modification
     List<Map.Entry<List<ManifestFile>, ManifestFile>> entries =
         Lists.newArrayList(mergedManifests.entrySet());
@@ -109,7 +113,7 @@ abstract class ManifestMergeManager<F extends ContentFile<F>> {
     for (Map.Entry<List<ManifestFile>, ManifestFile> entry : entries) {
       // delete any new merged manifests that aren't in the committed list
       ManifestFile merged = entry.getValue();
-      if (!committed.contains(merged)) {
+      if (!committed.contains(merged.path())) {
         deleteFile(merged.path());
         List<ManifestFile> bin = entry.getKey();
         mergedManifests.remove(bin);
@@ -192,7 +196,9 @@ abstract class ManifestMergeManager<F extends ContentFile<F>> {
     boolean threw = true;
     try {
       for (ManifestFile manifest : bin) {
-        try (ManifestReader<F> reader = newManifestReader(manifest)) {
+        boolean isCommitted =
+            manifest.snapshotId() != null && snapshotId() != manifest.snapshotId();
+        try (ManifestReader<F> reader = newManifestReader(manifest, isCommitted)) {
           for (ManifestEntry<F> entry : reader.entries()) {
             if (entry.status() == Status.DELETED) {
               // suppress deletes from previous snapshots. only files deleted by this snapshot

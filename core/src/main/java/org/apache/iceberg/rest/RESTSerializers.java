@@ -40,6 +40,8 @@ import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableMetadataParser;
 import org.apache.iceberg.UnboundPartitionSpec;
 import org.apache.iceberg.UnboundSortOrder;
+import org.apache.iceberg.catalog.CatalogObjectIdentifier;
+import org.apache.iceberg.catalog.CatalogObjectIdentifierParser;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.catalog.TableIdentifierParser;
@@ -78,6 +80,7 @@ import org.apache.iceberg.rest.responses.FetchScanTasksResponseParser;
 import org.apache.iceberg.rest.responses.ImmutableLoadCredentialsResponse;
 import org.apache.iceberg.rest.responses.ImmutableLoadViewResponse;
 import org.apache.iceberg.rest.responses.ImmutableRemoteSignResponse;
+import org.apache.iceberg.rest.responses.ImmutableUnregisterTableResponse;
 import org.apache.iceberg.rest.responses.LoadCredentialsResponse;
 import org.apache.iceberg.rest.responses.LoadCredentialsResponseParser;
 import org.apache.iceberg.rest.responses.LoadTableResponse;
@@ -89,6 +92,8 @@ import org.apache.iceberg.rest.responses.PlanTableScanResponse;
 import org.apache.iceberg.rest.responses.PlanTableScanResponseParser;
 import org.apache.iceberg.rest.responses.RemoteSignResponse;
 import org.apache.iceberg.rest.responses.RemoteSignResponseParser;
+import org.apache.iceberg.rest.responses.UnregisterTableResponse;
+import org.apache.iceberg.rest.responses.UnregisterTableResponseParser;
 import org.apache.iceberg.util.JsonUtil;
 
 public class RESTSerializers {
@@ -104,6 +109,8 @@ public class RESTSerializers {
         .addDeserializer(TableIdentifier.class, new TableIdentifierDeserializer())
         .addSerializer(Namespace.class, new NamespaceSerializer())
         .addDeserializer(Namespace.class, new NamespaceDeserializer())
+        .addSerializer(CatalogObjectIdentifier.class, new CatalogObjectIdentifierSerializer())
+        .addDeserializer(CatalogObjectIdentifier.class, new CatalogObjectIdentifierDeserializer())
         .addSerializer(Schema.class, new SchemaSerializer())
         .addDeserializer(Schema.class, new SchemaDeserializer())
         .addSerializer(UnboundPartitionSpec.class, new UnboundPartitionSpecSerializer())
@@ -149,6 +156,12 @@ public class RESTSerializers {
         .addDeserializer(ConfigResponse.class, new ConfigResponseDeserializer<>())
         .addSerializer(LoadTableResponse.class, new LoadTableResponseSerializer<>())
         .addDeserializer(LoadTableResponse.class, new LoadTableResponseDeserializer<>())
+        .addSerializer(UnregisterTableResponse.class, new UnregisterTableResponseSerializer<>())
+        .addSerializer(
+            ImmutableUnregisterTableResponse.class, new UnregisterTableResponseSerializer<>())
+        .addDeserializer(UnregisterTableResponse.class, new UnregisterTableResponseDeserializer<>())
+        .addDeserializer(
+            ImmutableUnregisterTableResponse.class, new UnregisterTableResponseDeserializer<>())
         .addSerializer(PlanTableScanRequest.class, new PlanTableScanRequestSerializer<>())
         .addDeserializer(PlanTableScanRequest.class, new PlanTableScanRequestDeserializer<>())
         .addSerializer(FetchScanTasksRequest.class, new FetchScanTasksRequestSerializer<>())
@@ -284,6 +297,26 @@ public class RESTSerializers {
         TableIdentifier identifier, JsonGenerator gen, SerializerProvider serializers)
         throws IOException {
       TableIdentifierParser.toJson(identifier, gen);
+    }
+  }
+
+  public static class CatalogObjectIdentifierDeserializer
+      extends JsonDeserializer<CatalogObjectIdentifier> {
+    @Override
+    public CatalogObjectIdentifier deserialize(JsonParser p, DeserializationContext context)
+        throws IOException {
+      JsonNode jsonNode = p.getCodec().readTree(p);
+      return CatalogObjectIdentifierParser.fromJson(jsonNode);
+    }
+  }
+
+  public static class CatalogObjectIdentifierSerializer
+      extends JsonSerializer<CatalogObjectIdentifier> {
+    @Override
+    public void serialize(
+        CatalogObjectIdentifier identifier, JsonGenerator gen, SerializerProvider serializers)
+        throws IOException {
+      CatalogObjectIdentifierParser.toJson(identifier, gen);
     }
   }
 
@@ -505,6 +538,24 @@ public class RESTSerializers {
     public void serialize(T request, JsonGenerator gen, SerializerProvider serializers)
         throws IOException {
       LoadTableResponseParser.toJson(request, gen);
+    }
+  }
+
+  static class UnregisterTableResponseSerializer<T extends UnregisterTableResponse>
+      extends JsonSerializer<T> {
+    @Override
+    public void serialize(T response, JsonGenerator gen, SerializerProvider serializers)
+        throws IOException {
+      UnregisterTableResponseParser.toJson(response, gen);
+    }
+  }
+
+  static class UnregisterTableResponseDeserializer<T extends UnregisterTableResponse>
+      extends JsonDeserializer<T> {
+    @Override
+    public T deserialize(JsonParser p, DeserializationContext context) throws IOException {
+      JsonNode jsonNode = p.getCodec().readTree(p);
+      return (T) UnregisterTableResponseParser.fromJson(jsonNode);
     }
   }
 

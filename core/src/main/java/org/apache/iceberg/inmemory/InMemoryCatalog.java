@@ -29,8 +29,11 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
 import org.apache.iceberg.BaseMetastoreTableOperations;
+import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
+import org.apache.iceberg.StaticTableOperations;
+import org.apache.iceberg.Table;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.catalog.Namespace;
@@ -101,6 +104,7 @@ public class InMemoryCatalog extends BaseMetastoreViewCatalog
     this.warehouseLocation = warehouse.replaceAll("/*$", "");
     this.io = CatalogUtil.loadFileIO(InMemoryFileIO.class.getName(), properties, null);
     this.closeableGroup = new CloseableGroup();
+    closeableGroup.addCloseable(io);
     closeableGroup.addCloseable(metricsReporter());
     closeableGroup.setSuppressCloseFailure(true);
   }
@@ -122,6 +126,27 @@ public class InMemoryCatalog extends BaseMetastoreViewCatalog
     } else {
       return SLASH.join(warehouseLocation, SLASH.join(namespace.levels()));
     }
+  }
+
+  @Override
+  public Table unregisterTable(TableIdentifier tableIdentifier) {
+    TableOperations ops = newTableOps(tableIdentifier);
+    TableMetadata metadata;
+
+    synchronized (this) {
+      metadata = ops.current();
+      if (metadata == null) {
+        throw new NoSuchTableException("Table does not exist: %s", tableIdentifier);
+      }
+
+      if (tables.remove(tableIdentifier) == null) {
+        throw new NoSuchTableException("Table does not exist: %s", tableIdentifier);
+      }
+    }
+
+    StaticTableOperations staticOps =
+        new StaticTableOperations(metadata, ops.io(), ops.locationProvider());
+    return new BaseTable(staticOps, tableIdentifier.name(), metricsReporter());
   }
 
   @Override
@@ -332,7 +357,9 @@ public class InMemoryCatalog extends BaseMetastoreViewCatalog
 
   @Override
   public void close() throws IOException {
-    closeableGroup.close();
+    if (closeableGroup != null) {
+      closeableGroup.close();
+    }
     namespaces.clear();
     tables.clear();
     views.clear();

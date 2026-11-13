@@ -29,6 +29,7 @@ import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.metrics.Counter;
 import org.apache.iceberg.metrics.MetricsContext;
 import org.apache.iceberg.metrics.MetricsContext.Unit;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 /**
  * A {@link SeekableInputStream} implementation that warp {@link S3Client#readObjectStream(String,
@@ -53,6 +54,7 @@ class EcsSeekableInputStream extends SeekableInputStream {
   private long pos = -1;
 
   private InputStream internalStream;
+  private boolean closed;
 
   private final Counter readBytes;
   private final Counter readOperations;
@@ -71,6 +73,8 @@ class EcsSeekableInputStream extends SeekableInputStream {
 
   @Override
   public void seek(long inputNewPos) {
+    Preconditions.checkState(!closed, "already closed");
+    Preconditions.checkArgument(inputNewPos >= 0, "position is negative: %s", inputNewPos);
     if (pos == inputNewPos) {
       return;
     }
@@ -98,6 +102,7 @@ class EcsSeekableInputStream extends SeekableInputStream {
   }
 
   private void checkAndUseNewPos() throws IOException {
+    Preconditions.checkState(!closed, "Cannot read: already closed");
     if (newPos < 0) {
       return;
     }
@@ -126,6 +131,7 @@ class EcsSeekableInputStream extends SeekableInputStream {
 
   @Override
   public void close() throws IOException {
+    closed = true;
     if (internalStream != null) {
       internalStream.close();
     }

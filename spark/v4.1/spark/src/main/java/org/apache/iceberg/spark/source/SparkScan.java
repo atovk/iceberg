@@ -49,6 +49,7 @@ import org.apache.iceberg.spark.source.metrics.NumSplits;
 import org.apache.iceberg.spark.source.metrics.PositionalDeleteFiles;
 import org.apache.iceberg.spark.source.metrics.ResultDataFiles;
 import org.apache.iceberg.spark.source.metrics.ResultDeleteFiles;
+import org.apache.iceberg.spark.source.metrics.ScanDuration;
 import org.apache.iceberg.spark.source.metrics.ScannedDataManifests;
 import org.apache.iceberg.spark.source.metrics.ScannedDeleteManifests;
 import org.apache.iceberg.spark.source.metrics.SkippedDataFiles;
@@ -234,12 +235,17 @@ abstract class SparkScan implements Scan, SupportsReportStatistics {
 
         Map<Integer, List<BlobMetadata>> groupedByField =
             metadataList.stream()
+                .filter(metadata -> !metadata.fields().isEmpty())
                 .collect(
                     Collectors.groupingBy(
                         metadata -> metadata.fields().get(0), Collectors.toList()));
 
+        Schema scanSchema = schema();
         for (Map.Entry<Integer, List<BlobMetadata>> entry : groupedByField.entrySet()) {
-          String colName = table.schema().findColumnName(entry.getKey());
+          String colName = scanSchema.findColumnName(entry.getKey());
+          if (colName == null) {
+            continue;
+          }
           NamedReference ref = FieldReference.column(colName);
           Long ndv = null;
 
@@ -340,6 +346,7 @@ abstract class SparkScan implements Scan, SupportsReportStatistics {
 
       // common
       new TotalPlanningDuration(),
+      new ScanDuration(),
 
       // data manifests
       new TotalDataManifests(),
@@ -369,8 +376,17 @@ abstract class SparkScan implements Scan, SupportsReportStatistics {
   protected long adjustSplitSize(List<? extends ScanTask> tasks, long splitSize) {
     if (readConf.splitSizeOption() == null && readConf.adaptiveSplitSizeEnabled()) {
       long scanSize = tasks.stream().mapToLong(ScanTask::sizeBytes).sum();
-      int parallelism = readConf.parallelism();
-      return TableScanUtil.adjustSplitSize(scanSize, parallelism, splitSize);
+      int parallelism = readConf.splitParallelism();
+      long adjustedSplitSize = TableScanUtil.adjustSplitSize(scanSize, parallelism, splitSize);
+      if (adjustedSplitSize != splitSize) {
+        LOG.debug(
+            "Adjusted split size from {} to {} for table {} with parallelism {}",
+            splitSize,
+            adjustedSplitSize,
+            table().name(),
+            parallelism);
+      }
+      return adjustedSplitSize;
     } else {
       return splitSize;
     }

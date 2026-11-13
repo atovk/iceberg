@@ -25,8 +25,6 @@ import com.google.api.services.bigquery.model.ExternalCatalogDatasetOptions;
 import com.google.api.services.bigquery.model.TableReference;
 import com.google.cloud.bigquery.BigQueryOptions;
 import java.io.IOException;
-import java.io.UncheckedIOException;
-import java.security.GeneralSecurityException;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -42,6 +40,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.hadoop.Configurable;
+import org.apache.iceberg.io.CloseableGroup;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -57,24 +56,6 @@ import org.slf4j.LoggerFactory;
 public class BigQueryMetastoreCatalog extends BaseMetastoreCatalog
     implements SupportsNamespaces, Configurable<Object> {
 
-  /**
-   * @deprecated since 1.11.0, will be removed in 1.12.0; use {@link BigQueryProperties#PROJECT_ID}
-   *     instead.
-   */
-  @Deprecated public static final String PROJECT_ID = "gcp.bigquery.project-id";
-
-  /**
-   * @deprecated since 1.11.0, will be removed in 1.12.0; use {@link
-   *     BigQueryProperties#GCP_LOCATION} instead.
-   */
-  @Deprecated public static final String GCP_LOCATION = "gcp.bigquery.location";
-
-  /**
-   * @deprecated since 1.11.0, will be removed in 1.12.0; use {@link
-   *     BigQueryProperties#LIST_ALL_TABLES} instead.
-   */
-  @Deprecated public static final String LIST_ALL_TABLES = "gcp.bigquery.list-all-tables";
-
   private static final Logger LOG = LoggerFactory.getLogger(BigQueryMetastoreCatalog.class);
 
   private String catalogName;
@@ -86,6 +67,7 @@ public class BigQueryMetastoreCatalog extends BaseMetastoreCatalog
   private BigQueryMetastoreClient client;
   private boolean listAllTables;
   private String warehouseLocation;
+  private CloseableGroup closeableGroup;
 
   public BigQueryMetastoreCatalog() {}
 
@@ -100,13 +82,7 @@ public class BigQueryMetastoreCatalog extends BaseMetastoreCatalog
 
     BigQueryOptions bigQueryOptions = bigQueryProperties.metastoreOptions();
 
-    try {
-      client = new BigQueryMetastoreClientImpl(bigQueryOptions);
-    } catch (IOException e) {
-      throw new UncheckedIOException("Creating BigQuery client failed", e);
-    } catch (GeneralSecurityException e) {
-      throw new RuntimeException("Creating BigQuery client failed due to a security issue", e);
-    }
+    client = new BigQueryMetastoreClientImpl(bigQueryOptions);
 
     initialize(name, properties, projectId, projectLocation, client);
   }
@@ -138,6 +114,11 @@ public class BigQueryMetastoreCatalog extends BaseMetastoreCatalog
                 CatalogProperties.FILE_IO_IMPL, "org.apache.iceberg.io.ResolvingFileIO"),
             properties,
             conf);
+
+    this.closeableGroup = new CloseableGroup();
+    closeableGroup.addCloseable(fileIO);
+    closeableGroup.addCloseable(metricsReporter());
+    closeableGroup.setSuppressCloseFailure(true);
   }
 
   @Override
@@ -295,6 +276,13 @@ public class BigQueryMetastoreCatalog extends BaseMetastoreCatalog
   @Override
   public String name() {
     return catalogName;
+  }
+
+  @Override
+  public void close() throws IOException {
+    if (closeableGroup != null) {
+      closeableGroup.close();
+    }
   }
 
   @Override

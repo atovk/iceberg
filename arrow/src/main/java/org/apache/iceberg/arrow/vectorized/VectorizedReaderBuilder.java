@@ -27,6 +27,7 @@ import org.apache.arrow.memory.BufferAllocator;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.arrow.ArrowAllocation;
 import org.apache.iceberg.arrow.vectorized.VectorizedArrowReader.ConstantVectorReader;
+import org.apache.iceberg.parquet.ParquetVariantVisitor;
 import org.apache.iceberg.parquet.TypeWithSchemaVisitor;
 import org.apache.iceberg.parquet.VectorizedReader;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
@@ -155,13 +156,21 @@ public class VectorizedReaderBuilder extends TypeWithSchemaVisitor<VectorizedRea
   }
 
   @Override
+  public ParquetVariantVisitor<VectorizedReader<?>> variantVisitor() {
+    // skip variants that are not projected, like primitives, so their shredded layout is not read
+    Type variant = parquetSchema.getType(currentPath());
+    if (variant.getId() == null || icebergSchema.findField(variant.getId().intValue()) == null) {
+      return null;
+    }
+
+    return new VectorizedVariantVisitor(
+        currentPath(), parquetSchema, icebergSchema, rootAllocator, setArrowValidityVector);
+  }
+
+  @Override
   public VectorizedReader<?> variant(
       Types.VariantType iVariant, GroupType variant, VectorizedReader<?> result) {
-    if (iVariant != null) {
-      throw new UnsupportedOperationException(
-          "Vectorized reads are not supported yet for variant fields");
-    }
-    return null;
+    return result;
   }
 
   @Override

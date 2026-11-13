@@ -39,6 +39,7 @@ import org.apache.flink.table.factories.DynamicTableSourceFactory;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.flink.source.IcebergTableSource;
+import org.apache.iceberg.flink.source.lookup.IcebergLookupOptions;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
@@ -132,6 +133,7 @@ public class FlinkDynamicTableFactory
     options.add(FlinkCreateTableOptions.CATALOG_TABLE);
     options.add(FlinkCreateTableOptions.USE_DYNAMIC_ICEBERG_SINK);
     options.add(FlinkCreateTableOptions.DYNAMIC_RECORD_GENERATOR_IMPL);
+    options.add(IcebergLookupOptions.FULL_CACHE_EAGER_LOAD);
     return options;
   }
 
@@ -237,13 +239,13 @@ public class FlinkDynamicTableFactory
   }
 
   /**
-   * Merges source catalog properties with connector properties. Iceberg Catalog properties are
-   * serialized as json in FlinkCatalog#getTable to be able to isolate catalog props from iceberg
-   * table props, Here, we flatten and merge them back to use to create catalog.
+   * Merges source catalog properties (catalog name, database, table) with connector properties.
+   * Source catalog name, database, table are serialized as json in FlinkCatalog#getTable to be able
+   * to isolate them from iceberg table props, Here, we flatten and merge them back.
    *
    * @param tableProps the existing table properties
-   * @return a map of merged properties, with source catalog properties taking precedence when keys
-   *     conflict
+   * @return a map of merged properties, defaulting to source catalog name, database and table
+   *     unless overridden.
    */
   private static Map<String, String> mergeSrcCatalogProps(Map<String, String> tableProps) {
     String srcCatalogProps = tableProps.get(FlinkCreateTableOptions.SRC_CATALOG_PROPS_KEY);
@@ -257,7 +259,6 @@ public class FlinkDynamicTableFactory
           FlinkCreateTableOptions.CATALOG_DATABASE.key(), createTableOptions.catalogDb());
       mergedProps.put(
           FlinkCreateTableOptions.CATALOG_TABLE.key(), createTableOptions.catalogTable());
-      mergedProps.putAll(createTableOptions.catalogProps());
 
       tableProps.forEach(
           (k, v) -> {
